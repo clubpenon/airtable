@@ -6,10 +6,7 @@
 // Create a function so we can "return".
 async function process_record() {
 
-// This makes the "error" value always available in the next step.
-output.set('error', '');
-
-// Get the recordId of the record that is being created/processed.
+// Get the recordId of the record that is being processed.
 let config = input.config();
 let recordId = config.recordId;
 console.log(`Processing transaction record with ID "${recordId}".`);
@@ -19,66 +16,69 @@ let transactionsTable = base.getTable("Transactions");
 let transactions = await transactionsTable.selectRecordsAsync({recordIds: [recordId], fields: transactionsTable.fields});
 let transaction = transactions.getRecord(recordId);
 
-// Iterate on linked transactions and link them back.
-let linkedTransactions = transaction.getCellValue("Linked Transactions") || [];
-for (let t of linkedTransactions) {
-    // Fetch the linked transaction's linked transactions.
-    let tlt = await transactionsTable.selectRecordsAsync({recordIds: [t.id], fields: transactionsTable.fields});
-    let tt = tlt.getRecord(t.id);
-    let ttlt = tt.getCellValue("Linked Transactions") || [];
-    if (ttlt.some(linked => linked.id === recordId)) {
+// In this script, "links" is shorthand for "Linked Transactions" cell values.
+
+// --- PART 1: Link back ---
+// For each transaction in our links, make sure it links back to us.
+let links = transaction.getCellValue("Linked Transactions") || [];
+for (let linkRef of links) {
+    // Fetch the linked transaction record and its own links.
+    let linkedQuery = await transactionsTable.selectRecordsAsync({recordIds: [linkRef.id], fields: transactionsTable.fields});
+    let linkedRecord = linkedQuery.getRecord(linkRef.id);
+    let linkedRecordLinks = linkedRecord.getCellValue("Linked Transactions") || [];
+    // If it already links back to us, nothing to do.
+    if (linkedRecordLinks.some(ref => ref.id === recordId)) {
+        console.log(`Transaction "${linkRef.id}" already links back to "${recordId}", skipping.`);
         continue;
     }
-    let ttltn = [
-        ...ttlt.map(v => ({ id: v.id })),
+    // Add us to its links.
+    let updatedLinks = [
+        ...linkedRecordLinks.map(ref => ({ id: ref.id })),
         { id: recordId }
     ];
-    // Update the linked transaction's linked transactions.
     try {
-        await transactionsTable.updateRecordAsync(t.id, {
-            "Linked Transactions": ttltn,
+        await transactionsTable.updateRecordAsync(linkRef.id, {
+            "Linked Transactions": updatedLinks,
         });
     } catch (error) {
-        console.log(`Error: Failed to link transaction "${t.id} back to transaction "${recordId}": ${error.message}.`);
-        output.set('error', `Failed to link transaction "${t.id} back to transaction "${recordId}": ${error.message}.`);
-        return false;
+        throw new Error(`Failed to link transaction "${linkRef.id}" back to transaction "${recordId}": ${error.message}`);
     }
-    console.log(`Successfully linked transaction "${t.id}" back to transaction "${recordId}".`);
+    console.log(`Successfully linked transaction "${linkRef.id}" back to transaction "${recordId}".`);
 }
 
-// Find all transactions that link to the current transaction but are
-// not found in its list of linked transactions and therefore should
-// be unlinked.
+// --- PART 2: Unlink stale reverse links ---
+// When a link is removed from our record, the other transaction may still
+// link back to us. We scan all transactions to find and clean up these
+// stale reverse links.
 let allTransactions = await transactionsTable.selectRecordsAsync({fields: [transactionsTable.getField("Linked Transactions")]});
-// Create a set for faster lookup.
-let linkedTransactionsSet = new Set(linkedTransactions.map(record => record.id));
-for (let aRecord of allTransactions.records) {
-    // Get the linked transactions for the current record.
-    let linkedTransactions = aRecord.getCellValue("Linked Transactions") || [];
-    // Check if the current record links back to our transaction.
-    if (!linkedTransactions.some(linked => linked.id === recordId)) {
+let linksSet = new Set(links.map(ref => ref.id));
+for (let record of allTransactions.records) {
+    // Skip self.
+    if (record.id === recordId) {
         continue;
     }
-    // If this record should link back to A, skip.
-    if (linkedTransactionsSet.has(aRecord.id)) {
+    let recordLinks = record.getCellValue("Linked Transactions") || [];
+    // Skip if this record doesn't link to us.
+    if (!recordLinks.some(ref => ref.id === recordId)) {
         continue;
     }
-    // Otherwise, we must remove the link.
-    let updatedLinkedTransactions = linkedTransactions.filter(linked => linked.id !== recordId);
+    // Skip if we still link to this record (the link is valid, not stale).
+    if (linksSet.has(record.id)) {
+        continue;
+    }
+    // This record links to us but we no longer link to it. Remove the stale reverse link.
+    let cleanedLinks = recordLinks.filter(ref => ref.id !== recordId);
     try {
-        await transactionsTable.updateRecordAsync(aRecord.id, {
-                "Linked Transactions": updatedLinkedTransactions
+        await transactionsTable.updateRecordAsync(record.id, {
+                "Linked Transactions": cleanedLinks
         });
     } catch (error) {
-        console.log(`Error: Failed to unlink transaction "${recordId} from transaction "${aRecord.id}": ${error.message}.`);
-        output.set('error', `Failed to unlink transaction "${recordId} from transaction "${aRecord.id}": ${error.message}.`);
-        return false;
+        throw new Error(`Failed to unlink transaction "${recordId}" from transaction "${record.id}": ${error.message}`);
     }
-    console.log(`Successfully unlinked transaction "${recordId}" from transaction "${aRecord.id}".`);
-};
-
-return true;
+    console.log(`Successfully unlinked transaction "${recordId}" from transaction "${record.id}".`);
 }
 
-let result = await process_record();
-output.set('return', result);
+console.log(`Done processing transaction record with ID "${recordId}".`);
+}
+
+process_record();
